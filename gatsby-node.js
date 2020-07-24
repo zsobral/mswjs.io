@@ -1,5 +1,11 @@
+require('dotenv').config()
+
 const path = require('path')
+const { until } = require('@open-draft/until')
+const { createApolloFetch } = require('apollo-fetch')
 const { createFilePath } = require('gatsby-source-filesystem')
+
+const IS_DEV = process.env.NODE_ENV === 'development'
 
 const REPO_URL = 'https://github.com/mswjs/mswjs.io'
 const DOCS_BASE_PATH = 'docs'
@@ -11,6 +17,92 @@ const DOCS_CATEGORY_TEMPLATE = path.resolve(
   __dirname,
   'src/templates/docs/categoryPage.tsx',
 )
+
+const fetchFromGitHub = createApolloFetch({
+  uri: 'https://api.github.com/graphql',
+})
+
+fetchFromGitHub.use(({ options }, next) => {
+  if (!options.headers) {
+    options.headers = {}
+  }
+  options.headers.authorization = `bearer ${process.env.GITHUB_ACCESS_TOKEN}`
+  next()
+})
+
+async function getContributors(pages) {
+  const pageObjects = pages.map(
+    ({ node }, index) => `
+      page${index}: object(expression: "master") {
+        ... on Commit {
+          history(path: "${node.fields.relativeFilePath}", first: 100) {
+            nodes {
+              author {
+                user {
+                  id
+                  avatarUrl(size: 100)
+                  url
+                }
+              }
+            }
+          }
+        }
+      }
+    `,
+  )
+
+  const CONTRIBUTORS_QUERY = `
+    {
+      repository(name: "mswjs.io", owner: "mswjs") {
+        ${pageObjects}
+      }
+    }
+  `
+
+  // Make a single query to the GitHub GraphQL API
+  // to fetch contributors to all documentation pages.
+  const [error, res] = await until(() =>
+    fetchFromGitHub({ query: CONTRIBUTORS_QUERY }),
+  )
+
+  if (error || res.errors) {
+    console.log('Experienced errors!!')
+    console.log(JSON.stringify(res))
+    return []
+  }
+
+  const { data } = res
+
+  console.log(JSON.stringify(res, null, 2))
+
+  const contributors = Object.entries(data.repository).reduce(
+    (acc, [verboseIndex, chunk]) => {
+      const pageIndex = Number(verboseIndex.replace('page', ''))
+      const page = pages[pageIndex]
+      const { nodes: allContributors } = chunk.history
+
+      const uniqueContributors = allContributors.reduce((acc, node) => {
+        const isUnique = acc.every(
+          (existingContributor) =>
+            existingContributor.id !== node.author.user.id,
+        )
+
+        if (!isUnique) {
+          return acc
+        }
+
+        return acc.concat(node.author.user)
+      }, [])
+
+      acc[page.node.id] = uniqueContributors
+
+      return acc
+    },
+    {},
+  )
+
+  return contributors
+}
 
 exports.createPages = async ({ actions, graphql }) => {
   const { errors, data } = await graphql(`
@@ -24,6 +116,7 @@ exports.createPages = async ({ actions, graphql }) => {
             id
             fileAbsolutePath
             fields {
+              relativeFilePath
               url
               isHomepage
             }
@@ -50,6 +143,10 @@ exports.createPages = async ({ actions, graphql }) => {
 
   const navTree = createNavTree(allPages)
 
+  // Do not fetch page contributors during development
+  // to prevent the GitHub access token reaching the rate limit.
+  const contributors = IS_DEV ? [] : await getContributors(allPages)
+
   const [categories, pages] = allPages.reduce(
     (acc, { node }) => {
       const [prevCategories, prevPages] = acc
@@ -72,6 +169,7 @@ exports.createPages = async ({ actions, graphql }) => {
         postId: node.id,
         breadcrumbs: getDocumentBreadcrumbs(node, navTree),
         navTree,
+        contributors: contributors[node.id],
       },
     })
   })
@@ -124,6 +222,7 @@ exports.createPages = async ({ actions, graphql }) => {
         childNavTree,
         breadcrumbs: getDocumentBreadcrumbs(node, navTree),
         navTree,
+        contributors: contributors[node.id],
       },
     })
   })
